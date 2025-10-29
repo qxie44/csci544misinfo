@@ -1,0 +1,247 @@
+import pandas as pd
+import numpy as np
+import torch
+from torch import nn
+from torch.utils.data import Dataset, DataLoader
+from transformers import AutoTokenizer, AutoModel
+from sklearn.metrics import accuracy_score, classification_report
+from sklearn.model_selection import train_test_split
+from tqdm import tqdm
+
+
+def load_data(filepath: str) -> pd.DataFrame:
+    columns = [
+        'id', 'label', 'statement', 'subject', 'speaker', 'job_title',
+        'state', 'party', 'barely_true_ct', 'false_ct', 'half_true_ct', 
+        'mostly_true_ct', 'pants_fire_ct', 'context'
+    ]
+    df = pd.read_csv(filepath, sep='\t', header=None, names=columns)
+    count_cols = ['barely_true_ct', 'false_ct', 'half_true_ct', 'mostly_true_ct', 'pants_fire_ct']
+    df[count_cols] = df[count_cols].apply(pd.to_numeric, errors='coerce')
+    return df
+
+#Using DistilBERT for classifying missinfo, better than log regression. BC logistic regression loses a lot of context & semantics, harder to determine missinfo Used in HW2
+#Loads data, trains it, and then evaluates it. Built off of Tia's code
+#used model learned from HW2 to handle multi class classification and creates a label mapping for it. Then saves the best model
+
+
+class MisinformationDataset(Dataset):
+    def __init__(self, data, tokenizer, max_len=512):
+        self.data = data
+        self.tokenizer = tokenizer
+        self.max_len = max_len
+        self.len = len(data['input'])
+        self.prepare()
+    
+    def prepare(self):
+        #Tokenization
+        self.input_ids = []
+        self.attention_masks = []
+        
+        for text in self.data['input']:
+            encoded = self.tokenizer.encode_plus(
+                text,
+                add_special_tokens=True,
+                max_length=self.max_len,
+                padding='max_length',
+                truncation=True,
+                return_attention_mask=True,
+                return_tensors='pt'
+            )
+            
+            self.input_ids.append(encoded['input_ids'].squeeze())
+            self.attention_masks.append(encoded['attention_mask'].squeeze())
+    
+    def __len__(self):
+        return self.len
+    
+    def __getitem__(self, idx):
+        return {
+            'input_ids': self.input_ids[idx],
+            'attention_mask': self.attention_masks[idx],
+            'label': torch.tensor(self.data['label'][idx], dtype=torch.long)
+        }
+
+
+class ClassificationModel(nn.Module):
+    """DistilBERT classification model - from HW2"""
+    def __init__(self, base_model, num_classes):
+        super().__init__()
+        self.base_model = base_model
+        self.dropout = nn.Dropout(0.5)
+        # DistilBERT hidden size is 768
+        self.linear = nn.Linear(768, num_classes)
+        self.softmax = nn.Softmax(dim=1)
+    
+    def forward(self, input_ids, attention_mask):
+        outputs = self.base_model(input_ids=input_ids, attention_mask=attention_mask)
+        pooled_output = outputs.last_hidden_state[:, 0, :]
+        pooled_output = self.dropout(pooled_output) #dropout
+        logits = self.linear(pooled_output)
+        predicts = self.softmax(logits)
+        return predicts
+
+
+def prepare_label_mapping(train_df):
+    unique_labels = sorted(train_df['label'].unique())
+    label_to_id = {label: idx for idx, label in enumerate(unique_labels)}
+    id_to_label = {idx: label for label, idx in label_to_id.items()}
+    print(f"\nLabel mapping:")
+    for label, idx in label_to_id.items():
+        print(f"  {label} -> {idx}")
+    return label_to_id, id_to_label
+
+
+def train_model(train_df, valid_df, epochs=5, batch_size=16, learning_rate=2e-5):
+    device = torch.device("cuda:0" if torch.cuda.is_available() else "cpu")
+    print(f"\device: {device}")
+    label_to_id, id_to_label = prepare_label_mapping(train_df)
+    num_classes = len(label_to_id)
+    train_labels = [label_to_id[label] for label in train_df['label']]
+    valid_labels = [label_to_id[label] for label in valid_df['label']]
+    print("\nLoad DistilBERT:")
+    tokenizer = AutoTokenizer.from_pretrained('distilbert/distilbert-base-uncased')
+    bertmodel = AutoModel.from_pretrained('distilbert/distilbert-base-uncased')
+    #Creating datasets
+    print("Prep datasets:")
+    train_data = {'input': train_df['statement'].tolist(), 'label': train_labels}
+    valid_data = {'input': valid_df['statement'].tolist(), 'label': valid_labels}
+    train_dataset = MisinformationDataset(train_data, tokenizer)
+    valid_dataset = MisinformationDataset(valid_data, tokenizer)
+    
+    #dataloaders
+    train_dataloader = DataLoader(train_dataset, batch_size=batch_size, shuffle=True)
+    valid_dataloader = DataLoader(valid_dataset, batch_size=batch_size, shuffle=False)
+    
+    model = ClassificationModel(base_model=bertmodel, num_classes=num_classes)
+    model = model.to(device)
+    optimizer = torch.optim.AdamW(model.parameters(), lr=learning_rate)
+    criterion = nn.CrossEntropyLoss()
+
+    num_training_steps = epochs * len(train_dataloader)
+    best_model = None
+    best_loss = float('inf')
+    print(f"\nStarting training for {epochs} epochs:")
+    
+    with tqdm(total=num_training_steps, desc='Training') as pbar:
+        for epoch in range(epochs):
+            model.train()
+            train_loss = 0
+            train_correct = 0
+            train_total = 0
+            
+            for batch in train_dataloader:
+                input_ids = batch['input_ids'].to(device)
+                attention_mask = batch['attention_mask'].to(device)
+                labels = batch['label'].to(device)
+                optimizer.zero_grad()
+                outputs = model(input_ids, attention_mask) #forward pass
+                loss = criterion(outputs, labels)
+                loss.backward() #backward
+                optimizer.step()
+
+                train_loss += loss.item()
+                _, predicted = torch.max(outputs, 1)
+                train_total += labels.size(0)
+                train_correct += (predicted == labels).sum().item()
+                pbar.update(1)
+            
+            avg_train_loss = train_loss / len(train_dataloader)
+            train_acc = train_correct / train_total
+            print(f'\nEpoch {epoch + 1}: Train loss = {avg_train_loss:.4f}, Train acc = {train_acc:.1%}')
+            
+            #validation 
+            model.eval()
+            valid_loss = 0
+            valid_correct = 0
+            valid_total = 0
+            
+            with torch.no_grad():
+                for batch in valid_dataloader:
+                    input_ids = batch['input_ids'].to(device)
+                    attention_mask = batch['attention_mask'].to(device)
+                    labels = batch['label'].to(device)
+                    outputs = model(input_ids, attention_mask) #forward
+                    loss = criterion(outputs, labels)
+                    valid_loss += loss.item()
+                    _, predicted = torch.max(outputs, 1)
+                    valid_total += labels.size(0)
+                    valid_correct += (predicted == labels).sum().item()
+            
+            avg_valid_loss = valid_loss / len(valid_dataloader)
+            valid_acc = valid_correct / valid_total
+            print(f'Epoch {epoch + 1}: Valid loss = {avg_valid_loss:.4f}, Valid acc = {valid_acc:.1%}')
+            
+            if avg_valid_loss < best_loss:
+                best_loss = avg_valid_loss
+                best_model = model.state_dict().copy()
+                print(f'Best validation loss: {best_loss:.4f}. Saving')
+    
+    model.load_state_dict(best_model)
+    
+    return model, tokenizer, label_to_id, id_to_label
+
+
+def evaluate(model, tokenizer, test_df, label_to_id, id_to_label, batch_size=16):
+    device = torch.device("cuda:0" if torch.cuda.is_available() else "cpu")
+    model = model.to(device)
+    model.eval()
+    test_labels = [label_to_id[label] for label in test_df['label']]
+    #creating dataset
+    test_data = {'input': test_df['statement'].tolist(), 'label': test_labels}
+    test_dataset = MisinformationDataset(test_data, tokenizer)
+    test_dataloader = DataLoader(test_dataset, batch_size=batch_size, shuffle=False)
+    all_predictions = []
+    all_labels = []
+    
+    with torch.no_grad():
+        for batch in test_dataloader:
+            input_ids = batch['input_ids'].to(device)
+            attention_mask = batch['attention_mask'].to(device)
+            labels = batch['label'].to(device)
+            
+            outputs = model(input_ids, attention_mask)
+            _, predicted = torch.max(outputs, 1)
+            
+            all_predictions.extend(predicted.cpu().numpy())
+            all_labels.extend(labels.cpu().numpy())
+    
+    pred_labels = [id_to_label[pred] for pred in all_predictions]
+    true_labels = [id_to_label[label] for label in all_labels]
+    test_df = test_df.copy()
+    test_df['predicted'] = pred_labels
+    test_df['correct'] = test_df['predicted'] == test_df['label']
+    print(f"\nTest accuracy: {accuracy_score(true_labels, pred_labels):.1%}")
+    print(f"\nClassification Report:\n{classification_report(true_labels, pred_labels)}")
+    
+    return test_df
+
+
+if __name__ == "__main__":
+    print("Loading datasets:")
+    train_df = load_data('train.tsv')
+    valid_df = load_data('valid.tsv')
+    test_df = load_data('test.tsv')
+    
+    print(f"Train: {len(train_df)} | Valid: {len(valid_df)} | Test: {len(test_df)}")
+    print(f"\nLabel distribution:\n{train_df['label'].value_counts()}\n")
+    
+    print("Training DistilBERT model:")
+    model, tokenizer, label_to_id, id_to_label = train_model(
+        train_df, 
+        valid_df, 
+        epochs=3,  #bigger epcoh better result??
+        batch_size=16,  #could inc depending on GPU
+        learning_rate=2e-5
+    )
+    
+    print("\nEval on test set:")
+    test_df = evaluate(model, tokenizer, test_df, label_to_id, id_to_label)
+    
+    print("\nSaving model:") #save the model 
+    torch.save({
+        'model_state_dict': model.state_dict(),
+        'label_to_id': label_to_id,
+        'id_to_label': id_to_label
+    }, 'distilbert_misinformation_model.pt')
+    print("Model saved to 'distilbert_misinformation_model.pt'")
