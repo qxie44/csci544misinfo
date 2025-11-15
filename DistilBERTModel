@@ -17,24 +17,69 @@ def load_data(filepath: str) -> pd.DataFrame:
     ]
     df = pd.read_csv(filepath, sep='\t', header=None, names=columns)
     count_cols = ['barely_true_ct', 'false_ct', 'half_true_ct', 'mostly_true_ct', 'pants_fire_ct']
-    df[count_cols] = df[count_cols].apply(pd.to_numeric, errors='coerce')
+    df[count_cols] = df[count_cols].apply(pd.to_numeric, errors='coerce').fillna(0)
     return df
 
-#Using DistilBERT for classifying missinfo, better than log regression. BC logistic regression loses a lot of context & semantics, harder to determine missinfo Used in HW2
-#Loads data, trains it, and then evaluates it. Built off of Tia's code
-#used model learned from HW2 to handle multi class classification and creates a label mapping for it. Then saves the best model
+# Add this function after load_data:
+def convert_to_binary(label):
+    reliable = ['true', 'mostly-true', 'half-true']
+    return 'reliable' if label in reliable else 'unreliable'
 
 
-class MisinformationDataset(Dataset):
-    def __init__(self, data, tokenizer, max_len=512):
+def prepare_enhanced_text(row):
+    """Combine statement, subject, and context into one enhanced input"""
+    text_parts = []
+    
+    # Add subject if available
+    if pd.notna(row['subject']) and row['subject']:
+        text_parts.append(f"[Subject: {row['subject']}]")
+    
+    # Add the main statement
+    text_parts.append(row['statement'])
+    
+    # Add context if available
+    if pd.notna(row['context']) and row['context']:
+        text_parts.append(f"[Context: {row['context']}]")
+    
+    return " ".join(text_parts)
+
+
+def prepare_metadata_features(df):
+    """Prepare numerical metadata features for the model"""
+    # Historical accuracy counts (5 features)
+    count_cols = ['barely_true_ct', 'false_ct', 'half_true_ct', 'mostly_true_ct', 'pants_fire_ct']
+    
+    # Calculate total statements and credibility score
+    df['total_statements'] = df[count_cols].sum(axis=1)
+    df['credibility_score'] = (
+        df['mostly_true_ct'] * 1.0 + 
+        df['half_true_ct'] * 0.5 + 
+        df['barely_true_ct'] * 0.25 + 
+        df['false_ct'] * 0.0 + 
+        df['pants_fire_ct'] * -0.5
+    ) / (df['total_statements'] + 1)  # +1 to avoid division by zero
+    
+    # Encode party affiliation (democrat=1, republican=2, other=0)
+    party_map = {'democrat': 1, 'republican': 2}
+    df['party_encoded'] = df['party'].map(party_map).fillna(0)
+    
+    # Select features for the model
+    metadata_features = count_cols + ['total_statements', 'credibility_score', 'party_encoded']
+    
+    return df[metadata_features].values.astype(np.float32)
+
+
+class EnhancedMisinformationDataset(Dataset):
+    def __init__(self, data, metadata, tokenizer, max_len=512):
         self.data = data
+        self.metadata = metadata
         self.tokenizer = tokenizer
         self.max_len = max_len
         self.len = len(data['input'])
         self.prepare()
     
     def prepare(self):
-        #Tokenization
+        # Tokenization
         self.input_ids = []
         self.attention_masks = []
         
@@ -59,26 +104,40 @@ class MisinformationDataset(Dataset):
         return {
             'input_ids': self.input_ids[idx],
             'attention_mask': self.attention_masks[idx],
+            'metadata': torch.tensor(self.metadata[idx], dtype=torch.float32),
             'label': torch.tensor(self.data['label'][idx], dtype=torch.long)
         }
 
 
-class ClassificationModel(nn.Module):
-    """DistilBERT classification model - from HW2"""
-    def __init__(self, base_model, num_classes):
+class HybridClassificationModel(nn.Module):
+    """Enhanced DistilBERT with metadata features"""
+    def __init__(self, base_model, num_classes, metadata_dim=8):
         super().__init__()
         self.base_model = base_model
         self.dropout = nn.Dropout(0.5)
+        
         # DistilBERT hidden size is 768
-        self.linear = nn.Linear(768, num_classes)
+        # Combine BERT embeddings + metadata
+        self.fc1 = nn.Linear(768 + metadata_dim, 256)
+        self.fc2 = nn.Linear(256, num_classes)
+        self.relu = nn.ReLU()
         self.softmax = nn.Softmax(dim=1)
     
-    def forward(self, input_ids, attention_mask):
+    def forward(self, input_ids, attention_mask, metadata):
+        # Get BERT embeddings
         outputs = self.base_model(input_ids=input_ids, attention_mask=attention_mask)
         pooled_output = outputs.last_hidden_state[:, 0, :]
-        pooled_output = self.dropout(pooled_output) #dropout
-        logits = self.linear(pooled_output)
+        
+        # Combine with metadata
+        combined = torch.cat([pooled_output, metadata], dim=1)
+        combined = self.dropout(combined)
+        
+        # Feed through additional layers
+        x = self.relu(self.fc1(combined))
+        x = self.dropout(x)
+        logits = self.fc2(x)
         predicts = self.softmax(logits)
+        
         return predicts
 
 
@@ -92,39 +151,64 @@ def prepare_label_mapping(train_df):
     return label_to_id, id_to_label
 
 
-def train_model(train_df, valid_df, epochs=5, batch_size=16, learning_rate=2e-5):
+def train_model(train_df, valid_df, epochs=7, batch_size=16, learning_rate=2e-5):
     device = torch.device("cuda:0" if torch.cuda.is_available() else "cpu")
-    print(f"\device: {device}")
+    print(f"\nUsing device: {device}")
+    
+    # Prepare labels
     label_to_id, id_to_label = prepare_label_mapping(train_df)
     num_classes = len(label_to_id)
     train_labels = [label_to_id[label] for label in train_df['label']]
     valid_labels = [label_to_id[label] for label in valid_df['label']]
-    print("\nLoad DistilBERT:")
+    
+    # Prepare enhanced text (statement + subject + context)
+    print("\nPreparing enhanced text inputs...")
+    train_df['enhanced_text'] = train_df.apply(prepare_enhanced_text, axis=1)
+    valid_df['enhanced_text'] = valid_df.apply(prepare_enhanced_text, axis=1)
+    
+    # Prepare metadata features
+    print("Extracting metadata features...")
+    train_metadata = prepare_metadata_features(train_df)
+    valid_metadata = prepare_metadata_features(valid_df)
+    
+    print(f"Metadata features shape: {train_metadata.shape}")
+    print(f"Sample metadata: {train_metadata[0]}")
+    
+    # Load tokenizer and model
+    print("\nLoading DistilBERT...")
     tokenizer = AutoTokenizer.from_pretrained('distilbert/distilbert-base-uncased')
     bertmodel = AutoModel.from_pretrained('distilbert/distilbert-base-uncased')
-    #Creating datasets
-    print("Prep datasets:")
-    train_data = {'input': train_df['statement'].tolist(), 'label': train_labels}
-    valid_data = {'input': valid_df['statement'].tolist(), 'label': valid_labels}
-    train_dataset = MisinformationDataset(train_data, tokenizer)
-    valid_dataset = MisinformationDataset(valid_data, tokenizer)
     
-    #dataloaders
+    # Create datasets
+    print("Preparing datasets...")
+    train_data = {'input': train_df['enhanced_text'].tolist(), 'label': train_labels}
+    valid_data = {'input': valid_df['enhanced_text'].tolist(), 'label': valid_labels}
+    
+    train_dataset = EnhancedMisinformationDataset(train_data, train_metadata, tokenizer)
+    valid_dataset = EnhancedMisinformationDataset(valid_data, valid_metadata, tokenizer)
+    
+    # Create dataloaders
     train_dataloader = DataLoader(train_dataset, batch_size=batch_size, shuffle=True)
     valid_dataloader = DataLoader(valid_dataset, batch_size=batch_size, shuffle=False)
     
-    model = ClassificationModel(base_model=bertmodel, num_classes=num_classes)
+    # Initialize model
+    metadata_dim = train_metadata.shape[1]
+    model = HybridClassificationModel(base_model=bertmodel, num_classes=num_classes, metadata_dim=metadata_dim)
     model = model.to(device)
-    optimizer = torch.optim.AdamW(model.parameters(), lr=learning_rate)
+    
+    optimizer = torch.optim.AdamW(model.parameters(), lr=learning_rate, weight_decay=0.01)
     criterion = nn.CrossEntropyLoss()
-
+    
     num_training_steps = epochs * len(train_dataloader)
     best_model = None
     best_loss = float('inf')
+    
     print(f"\nStarting training for {epochs} epochs:")
+    print(f"Total training steps: {num_training_steps}")
     
     with tqdm(total=num_training_steps, desc='Training') as pbar:
         for epoch in range(epochs):
+            # Training phase
             model.train()
             train_loss = 0
             train_correct = 0
@@ -133,24 +217,28 @@ def train_model(train_df, valid_df, epochs=5, batch_size=16, learning_rate=2e-5)
             for batch in train_dataloader:
                 input_ids = batch['input_ids'].to(device)
                 attention_mask = batch['attention_mask'].to(device)
+                metadata = batch['metadata'].to(device)
                 labels = batch['label'].to(device)
+                
                 optimizer.zero_grad()
-                outputs = model(input_ids, attention_mask) #forward pass
+                outputs = model(input_ids, attention_mask, metadata)
                 loss = criterion(outputs, labels)
-                loss.backward() #backward
+                loss.backward()
                 optimizer.step()
-
+                
                 train_loss += loss.item()
                 _, predicted = torch.max(outputs, 1)
                 train_total += labels.size(0)
                 train_correct += (predicted == labels).sum().item()
+                
                 pbar.update(1)
             
             avg_train_loss = train_loss / len(train_dataloader)
             train_acc = train_correct / train_total
-            print(f'\nEpoch {epoch + 1}: Train loss = {avg_train_loss:.4f}, Train acc = {train_acc:.1%}')
+            print(f'\nEpoch {epoch + 1}/{epochs}:')
+            print(f'  Train loss = {avg_train_loss:.4f}, Train acc = {train_acc:.1%}')
             
-            #validation 
+            # Validation phase
             model.eval()
             valid_loss = 0
             valid_correct = 0
@@ -160,9 +248,12 @@ def train_model(train_df, valid_df, epochs=5, batch_size=16, learning_rate=2e-5)
                 for batch in valid_dataloader:
                     input_ids = batch['input_ids'].to(device)
                     attention_mask = batch['attention_mask'].to(device)
+                    metadata = batch['metadata'].to(device)
                     labels = batch['label'].to(device)
-                    outputs = model(input_ids, attention_mask) #forward
+                    
+                    outputs = model(input_ids, attention_mask, metadata)
                     loss = criterion(outputs, labels)
+                    
                     valid_loss += loss.item()
                     _, predicted = torch.max(outputs, 1)
                     valid_total += labels.size(0)
@@ -170,13 +261,15 @@ def train_model(train_df, valid_df, epochs=5, batch_size=16, learning_rate=2e-5)
             
             avg_valid_loss = valid_loss / len(valid_dataloader)
             valid_acc = valid_correct / valid_total
-            print(f'Epoch {epoch + 1}: Valid loss = {avg_valid_loss:.4f}, Valid acc = {valid_acc:.1%}')
+            print(f'  Valid loss = {avg_valid_loss:.4f}, Valid acc = {valid_acc:.1%}')
             
+            # Save best model
             if avg_valid_loss < best_loss:
                 best_loss = avg_valid_loss
                 best_model = model.state_dict().copy()
-                print(f'Best validation loss: {best_loss:.4f}. Saving')
+                print(f'  ✓ New best validation loss: {best_loss:.4f}. Saving model...')
     
+    # Load best model
     model.load_state_dict(best_model)
     
     return model, tokenizer, label_to_id, id_to_label
@@ -186,11 +279,17 @@ def evaluate(model, tokenizer, test_df, label_to_id, id_to_label, batch_size=16)
     device = torch.device("cuda:0" if torch.cuda.is_available() else "cpu")
     model = model.to(device)
     model.eval()
+    
+    # Prepare enhanced text and metadata
+    test_df['enhanced_text'] = test_df.apply(prepare_enhanced_text, axis=1)
+    test_metadata = prepare_metadata_features(test_df)
     test_labels = [label_to_id[label] for label in test_df['label']]
-    #creating dataset
-    test_data = {'input': test_df['statement'].tolist(), 'label': test_labels}
-    test_dataset = MisinformationDataset(test_data, tokenizer)
+    
+    # Create dataset
+    test_data = {'input': test_df['enhanced_text'].tolist(), 'label': test_labels}
+    test_dataset = EnhancedMisinformationDataset(test_data, test_metadata, tokenizer)
     test_dataloader = DataLoader(test_dataset, batch_size=batch_size, shuffle=False)
+    
     all_predictions = []
     all_labels = []
     
@@ -198,9 +297,10 @@ def evaluate(model, tokenizer, test_df, label_to_id, id_to_label, batch_size=16)
         for batch in test_dataloader:
             input_ids = batch['input_ids'].to(device)
             attention_mask = batch['attention_mask'].to(device)
+            metadata = batch['metadata'].to(device)
             labels = batch['label'].to(device)
             
-            outputs = model(input_ids, attention_mask)
+            outputs = model(input_ids, attention_mask, metadata)
             _, predicted = torch.max(outputs, 1)
             
             all_predictions.extend(predicted.cpu().numpy())
@@ -208,9 +308,11 @@ def evaluate(model, tokenizer, test_df, label_to_id, id_to_label, batch_size=16)
     
     pred_labels = [id_to_label[pred] for pred in all_predictions]
     true_labels = [id_to_label[label] for label in all_labels]
+    
     test_df = test_df.copy()
     test_df['predicted'] = pred_labels
     test_df['correct'] = test_df['predicted'] == test_df['label']
+    
     print(f"\nTest accuracy: {accuracy_score(true_labels, pred_labels):.1%}")
     print(f"\nClassification Report:\n{classification_report(true_labels, pred_labels)}")
     
@@ -218,30 +320,50 @@ def evaluate(model, tokenizer, test_df, label_to_id, id_to_label, batch_size=16)
 
 
 if __name__ == "__main__":
-    print("Loading datasets:")
+    print("="*60)
+    print("ENHANCED DISTILBERT WITH METADATA FEATURES")
+    print("="*60)
+    
+    print("\nLoading datasets...")
     train_df = load_data('train.tsv')
     valid_df = load_data('valid.tsv')
     test_df = load_data('test.tsv')
     
+    train_df['label'] = train_df['label'].apply(convert_to_binary)
+    valid_df['label'] = valid_df['label'].apply(convert_to_binary)
+    test_df['label'] = test_df['label'].apply(convert_to_binary)
+
     print(f"Train: {len(train_df)} | Valid: {len(valid_df)} | Test: {len(test_df)}")
     print(f"\nLabel distribution:\n{train_df['label'].value_counts()}\n")
     
-    print("Training DistilBERT model:")
+    print("\nTraining Enhanced DistilBERT model:")
+    print("Improvements:")
+    print("  ✓ Combined statement + subject + context")
+    print("  ✓ Added historical accuracy metadata")
+    print("  ✓ Added credibility score & party affiliation")
+    print("  ✓ Increased epochs to 7")
+    
     model, tokenizer, label_to_id, id_to_label = train_model(
         train_df, 
         valid_df, 
-        epochs=3,  #bigger epcoh better result??
-        batch_size=16,  #could inc depending on GPU
-        learning_rate=2e-5
+        epochs=7,  # Increased from 3
+        batch_size=16,
+        learning_rate=1e-5
     )
     
-    print("\nEval on test set:")
+    print("\n" + "="*60)
+    print("EVALUATION ON TEST SET")
+    print("="*60)
     test_df = evaluate(model, tokenizer, test_df, label_to_id, id_to_label)
     
-    print("\nSaving model:") #save the model 
+    print("\nSaving enhanced model...")
     torch.save({
         'model_state_dict': model.state_dict(),
         'label_to_id': label_to_id,
         'id_to_label': id_to_label
-    }, 'distilbert_misinformation_model.pt')
-    print("Model saved to 'distilbert_misinformation_model.pt'")
+    }, 'enhanced_distilbert_model.pt')
+    print("✓ Model saved to 'enhanced_distilbert_model.pt'")
+    
+    print("\n" + "="*60)
+    print("TRAINING COMPLETE!")
+    print("="*60)
