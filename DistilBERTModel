@@ -20,24 +20,19 @@ def load_data(filepath: str) -> pd.DataFrame:
     df[count_cols] = df[count_cols].apply(pd.to_numeric, errors='coerce').fillna(0)
     return df
 
-# Add this function after load_data:
 def convert_to_binary(label):
     reliable = ['true', 'mostly-true', 'half-true']
     return 'reliable' if label in reliable else 'unreliable'
 
 
 def prepare_enhanced_text(row):
-    """Combine statement, subject, and context into one enhanced input"""
     text_parts = []
     
-    # Add subject if available
     if pd.notna(row['subject']) and row['subject']:
         text_parts.append(f"[Subject: {row['subject']}]")
     
-    # Add the main statement
     text_parts.append(row['statement'])
     
-    # Add context if available
     if pd.notna(row['context']) and row['context']:
         text_parts.append(f"[Context: {row['context']}]")
     
@@ -45,11 +40,9 @@ def prepare_enhanced_text(row):
 
 
 def prepare_metadata_features(df):
-    """Prepare numerical metadata features for the model"""
-    # Historical accuracy counts (5 features)
+
     count_cols = ['barely_true_ct', 'false_ct', 'half_true_ct', 'mostly_true_ct', 'pants_fire_ct']
     
-    # Calculate total statements and credibility score
     df['total_statements'] = df[count_cols].sum(axis=1)
     df['credibility_score'] = (
         df['mostly_true_ct'] * 1.0 + 
@@ -57,13 +50,11 @@ def prepare_metadata_features(df):
         df['barely_true_ct'] * 0.25 + 
         df['false_ct'] * 0.0 + 
         df['pants_fire_ct'] * -0.5
-    ) / (df['total_statements'] + 1)  # +1 to avoid division by zero
+    ) / (df['total_statements'] + 1)  
     
-    # Encode party affiliation (democrat=1, republican=2, other=0)
     party_map = {'democrat': 1, 'republican': 2}
     df['party_encoded'] = df['party'].map(party_map).fillna(0)
     
-    # Select features for the model
     metadata_features = count_cols + ['total_statements', 'credibility_score', 'party_encoded']
     
     return df[metadata_features].values.astype(np.float32)
@@ -79,7 +70,6 @@ class EnhancedMisinformationDataset(Dataset):
         self.prepare()
     
     def prepare(self):
-        # Tokenization
         self.input_ids = []
         self.attention_masks = []
         
@@ -116,23 +106,19 @@ class HybridClassificationModel(nn.Module):
         self.base_model = base_model
         self.dropout = nn.Dropout(0.5)
         
-        # DistilBERT hidden size is 768
-        # Combine BERT embeddings + metadata
+
         self.fc1 = nn.Linear(768 + metadata_dim, 256)
         self.fc2 = nn.Linear(256, num_classes)
         self.relu = nn.ReLU()
         self.softmax = nn.Softmax(dim=1)
     
     def forward(self, input_ids, attention_mask, metadata):
-        # Get BERT embeddings
         outputs = self.base_model(input_ids=input_ids, attention_mask=attention_mask)
         pooled_output = outputs.last_hidden_state[:, 0, :]
         
-        # Combine with metadata
         combined = torch.cat([pooled_output, metadata], dim=1)
         combined = self.dropout(combined)
         
-        # Feed through additional layers
         x = self.relu(self.fc1(combined))
         x = self.dropout(x)
         logits = self.fc2(x)
@@ -155,43 +141,36 @@ def train_model(train_df, valid_df, epochs=7, batch_size=16, learning_rate=2e-5)
     device = torch.device("cuda:0" if torch.cuda.is_available() else "cpu")
     print(f"\nUsing device: {device}")
     
-    # Prepare labels
     label_to_id, id_to_label = prepare_label_mapping(train_df)
     num_classes = len(label_to_id)
     train_labels = [label_to_id[label] for label in train_df['label']]
     valid_labels = [label_to_id[label] for label in valid_df['label']]
     
-    # Prepare enhanced text (statement + subject + context)
-    print("\nPreparing enhanced text inputs...")
+    print("\nPreparing enhanced text inputs")
     train_df['enhanced_text'] = train_df.apply(prepare_enhanced_text, axis=1)
     valid_df['enhanced_text'] = valid_df.apply(prepare_enhanced_text, axis=1)
     
-    # Prepare metadata features
-    print("Extracting metadata features...")
+    print("Extracting metadata features")
     train_metadata = prepare_metadata_features(train_df)
     valid_metadata = prepare_metadata_features(valid_df)
     
     print(f"Metadata features shape: {train_metadata.shape}")
     print(f"Sample metadata: {train_metadata[0]}")
     
-    # Load tokenizer and model
-    print("\nLoading DistilBERT...")
+    print("\nLoading DistilBERT")
     tokenizer = AutoTokenizer.from_pretrained('distilbert/distilbert-base-uncased')
     bertmodel = AutoModel.from_pretrained('distilbert/distilbert-base-uncased')
     
-    # Create datasets
-    print("Preparing datasets...")
+    print("Preparing datasets")
     train_data = {'input': train_df['enhanced_text'].tolist(), 'label': train_labels}
     valid_data = {'input': valid_df['enhanced_text'].tolist(), 'label': valid_labels}
     
     train_dataset = EnhancedMisinformationDataset(train_data, train_metadata, tokenizer)
     valid_dataset = EnhancedMisinformationDataset(valid_data, valid_metadata, tokenizer)
     
-    # Create dataloaders
     train_dataloader = DataLoader(train_dataset, batch_size=batch_size, shuffle=True)
     valid_dataloader = DataLoader(valid_dataset, batch_size=batch_size, shuffle=False)
     
-    # Initialize model
     metadata_dim = train_metadata.shape[1]
     model = HybridClassificationModel(base_model=bertmodel, num_classes=num_classes, metadata_dim=metadata_dim)
     model = model.to(device)
@@ -208,7 +187,6 @@ def train_model(train_df, valid_df, epochs=7, batch_size=16, learning_rate=2e-5)
     
     with tqdm(total=num_training_steps, desc='Training') as pbar:
         for epoch in range(epochs):
-            # Training phase
             model.train()
             train_loss = 0
             train_correct = 0
@@ -238,7 +216,6 @@ def train_model(train_df, valid_df, epochs=7, batch_size=16, learning_rate=2e-5)
             print(f'\nEpoch {epoch + 1}/{epochs}:')
             print(f'  Train loss = {avg_train_loss:.4f}, Train acc = {train_acc:.1%}')
             
-            # Validation phase
             model.eval()
             valid_loss = 0
             valid_correct = 0
@@ -261,15 +238,13 @@ def train_model(train_df, valid_df, epochs=7, batch_size=16, learning_rate=2e-5)
             
             avg_valid_loss = valid_loss / len(valid_dataloader)
             valid_acc = valid_correct / valid_total
-            print(f'  Valid loss = {avg_valid_loss:.4f}, Valid acc = {valid_acc:.1%}')
+            print(f'Valid loss = {avg_valid_loss:.4f}, Valid acc = {valid_acc:.1%}')
             
-            # Save best model
             if avg_valid_loss < best_loss:
                 best_loss = avg_valid_loss
                 best_model = model.state_dict().copy()
-                print(f'  ✓ New best validation loss: {best_loss:.4f}. Saving model...')
+                print(f'New best validation loss: {best_loss:.4f}. Saving model')
     
-    # Load best model
     model.load_state_dict(best_model)
     
     return model, tokenizer, label_to_id, id_to_label
@@ -280,12 +255,10 @@ def evaluate(model, tokenizer, test_df, label_to_id, id_to_label, batch_size=16)
     model = model.to(device)
     model.eval()
     
-    # Prepare enhanced text and metadata
     test_df['enhanced_text'] = test_df.apply(prepare_enhanced_text, axis=1)
     test_metadata = prepare_metadata_features(test_df)
     test_labels = [label_to_id[label] for label in test_df['label']]
     
-    # Create dataset
     test_data = {'input': test_df['enhanced_text'].tolist(), 'label': test_labels}
     test_dataset = EnhancedMisinformationDataset(test_data, test_metadata, tokenizer)
     test_dataloader = DataLoader(test_dataset, batch_size=batch_size, shuffle=False)
@@ -320,11 +293,9 @@ def evaluate(model, tokenizer, test_df, label_to_id, id_to_label, batch_size=16)
 
 
 if __name__ == "__main__":
-    print("="*60)
     print("ENHANCED DISTILBERT WITH METADATA FEATURES")
-    print("="*60)
     
-    print("\nLoading datasets...")
+    print("\nLoading datasets")
     train_df = load_data('train.tsv')
     valid_df = load_data('valid.tsv')
     test_df = load_data('test.tsv')
@@ -337,33 +308,25 @@ if __name__ == "__main__":
     print(f"\nLabel distribution:\n{train_df['label'].value_counts()}\n")
     
     print("\nTraining Enhanced DistilBERT model:")
-    print("Improvements:")
-    print("  ✓ Combined statement + subject + context")
-    print("  ✓ Added historical accuracy metadata")
-    print("  ✓ Added credibility score & party affiliation")
-    print("  ✓ Increased epochs to 7")
+
     
     model, tokenizer, label_to_id, id_to_label = train_model(
         train_df, 
         valid_df, 
-        epochs=7,  # Increased from 3
+        epochs=7,  
         batch_size=16,
         learning_rate=1e-5
     )
     
-    print("\n" + "="*60)
     print("EVALUATION ON TEST SET")
-    print("="*60)
     test_df = evaluate(model, tokenizer, test_df, label_to_id, id_to_label)
     
-    print("\nSaving enhanced model...")
+    print("\nSaving enhanced model")
     torch.save({
         'model_state_dict': model.state_dict(),
         'label_to_id': label_to_id,
         'id_to_label': id_to_label
     }, 'enhanced_distilbert_model.pt')
-    print("✓ Model saved to 'enhanced_distilbert_model.pt'")
+    print("Model saved to 'enhanced_distilbert_model.pt'")
     
-    print("\n" + "="*60)
     print("TRAINING COMPLETE!")
-    print("="*60)
